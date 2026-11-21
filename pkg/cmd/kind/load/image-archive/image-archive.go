@@ -26,7 +26,6 @@ import (
 
 	"sigs.k8s.io/kind/pkg/cluster"
 	"sigs.k8s.io/kind/pkg/cluster/nodes"
-	"sigs.k8s.io/kind/pkg/cluster/nodeutils"
 	"sigs.k8s.io/kind/pkg/cmd"
 	"sigs.k8s.io/kind/pkg/log"
 
@@ -130,24 +129,51 @@ func loadArchiveToNodes(logger log.Logger, provider *cluster.Provider, clusterNa
 		}
 	}
 
-	// Load the image on the selected nodes
+	// Parse the archive exactly once, on the host, before touching any node.
+	// A malformed or truncated archive is reported here rather than after
+	// some nodes have already been modified.
+	archive, err := ParseArchive(imageArchivePath)
+	if err != nil {
+		return err
+	}
+	if !archive.Comparable() {
+		logger.Warnf("image archive %q cannot be compared image by image (%s); importing the whole archive on every node", imageArchivePath, archive.FallbackReason())
+	}
+
+	// Each node is handled independently: nodes may hold different images,
+	// so one node's result must not stand in for another's. Results are
+	// reported per node; a failure on one node does not undo success on
+	// another, and this is not a cross-node transaction.
+	return loadNodes(logger, archive, selectedNodes)
+}
+
+func loadNodes(logger log.Logger, archive *Archive, selectedNodes []nodes.Node) error {
 	fns := []func() error{}
+	resultCh := make(chan string, len(selectedNodes))
 	for _, selectedNode := range selectedNodes {
 		selectedNode := selectedNode // capture loop variable
 		fns = append(fns, func() error {
-			return loadImage(logger, imageArchivePath, selectedNode)
+			var (
+				result applyResult
+				err    error
+			)
+			if archive.Comparable() {
+				result, err = loadArchiveToNode(logger, archive, selectedNode)
+			} else {
+				result, err = importWholeArchive(logger, archive, selectedNode)
+			}
+			if err != nil {
+				logger.Errorf("node %q: %v", selectedNode.String(), err)
+				return errors.Wrapf(err, "node %q", selectedNode.String())
+			}
+			resultCh <- summarize(selectedNode.String(), result)
+			return nil
 		})
 	}
-	return errors.UntilErrorConcurrent(fns)
-}
-
-// loads an image tarball onto a node
-func loadImage(logger log.Logger, imageTarName string, node nodes.Node) error {
-	f, err := os.Open(imageTarName)
-	if err != nil {
-		return errors.Wrap(err, "failed to open image")
+	err := errors.AggregateConcurrent(fns)
+	close(resultCh)
+	for line := range resultCh {
+		logger.V(0).Info(line)
 	}
-	defer f.Close()
-	logger.V(2).Infof("Loading Docker Image from archive %s to node %s", imageTarName, node.String())
-	return nodeutils.LoadImageArchive(node, f)
+	return err
 }

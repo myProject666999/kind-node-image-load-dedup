@@ -79,13 +79,78 @@ func CopyNodeToNode(a, b nodes.Node, file string) error {
 
 // LoadImageArchive loads image onto the node, where image is a Reader over an image archive
 func LoadImageArchive(n nodes.Node, image io.Reader) error {
-	snapshotter, err := getSnapshotter(n)
+	return NewImageImporter(n).Import(image)
+}
+
+// ImageImporter performs image operations against a node's container runtime.
+//
+// The snapshotter is detected lazily, so a command that ends up importing
+// nothing never pays for the extra `containerd config dump` round trip.
+type ImageImporter struct {
+	n              nodes.Node
+	snapshotter    string
+	snapshotterSet bool
+}
+
+// NewImageImporter returns an ImageImporter for node n
+func NewImageImporter(n nodes.Node) *ImageImporter {
+	return &ImageImporter{n: n}
+}
+
+// Import imports an image archive into the node's runtime
+func (i *ImageImporter) Import(image io.Reader) error {
+	cmd, err := i.importCommand()
 	if err != nil {
 		return err
 	}
-	cmd := n.Command("ctr", "--namespace=k8s.io", "images", "import", "--all-platforms", "--digests", "--snapshotter="+snapshotter, "-").SetStdin(image)
-	if err := cmd.Run(); err != nil {
+	if err := cmd.SetStdin(image).Run(); err != nil {
 		return errors.Wrap(err, "failed to load image")
+	}
+	return nil
+}
+
+// ImportStream is like Import, but the archive is produced on the fly by
+// write. This is used to stream a subset of a larger archive to the node
+// without buffering or repacking it on disk first.
+func (i *ImageImporter) ImportStream(write func(io.Writer) error) error {
+	cmd, err := i.importCommand()
+	if err != nil {
+		return err
+	}
+	if err := exec.RunWithStdinWriter(cmd, write); err != nil {
+		return errors.Wrap(err, "failed to load image")
+	}
+	return nil
+}
+
+func (i *ImageImporter) importCommand() (exec.Cmd, error) {
+	snapshotter, err := i.snapshotterName()
+	if err != nil {
+		return nil, err
+	}
+	return i.n.Command("ctr", "--namespace=k8s.io", "images", "import", "--all-platforms", "--digests", "--snapshotter="+snapshotter, "-"), nil
+}
+
+func (i *ImageImporter) snapshotterName() (string, error) {
+	if i.snapshotterSet {
+		return i.snapshotter, nil
+	}
+	snapshotter, err := getSnapshotter(i.n)
+	if err != nil {
+		return "", err
+	}
+	i.snapshotter = snapshotter
+	i.snapshotterSet = true
+	return snapshotter, nil
+}
+
+// TagImage points the name target at the content currently referenced by
+// source. source must be a name or digest reference already known to the
+// runtime. The tag is applied unconditionally, so an existing target name
+// that points at different content is re-pointed.
+func TagImage(n nodes.Node, source, target string) error {
+	if err := n.Command("ctr", "--namespace=k8s.io", "images", "tag", "--force", source, target).Run(); err != nil {
+		return errors.Wrapf(err, "failed to tag image %q as %q", source, target)
 	}
 	return nil
 }

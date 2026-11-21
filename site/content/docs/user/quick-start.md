@@ -256,6 +256,25 @@ kind load docker-image my-app:latest --name test-cluster
 Additionally, image archives can be loaded with:
 `kind load image-archive /my-image-archive.tar`
 
+`kind load image-archive` parses the archive once on the host, then checks
+each node: images whose content and tags are already present are skipped,
+and when the content is present but only some tags are missing (or a tag
+points at different content), the tag is repaired without importing the
+layers again. This keeps repeated loads of large archives cheap, while
+never leaving a node on stale content: if a tag exists but points at other
+content, the archive's content is imported so the tag resolves to the new
+image. Per-node decisions are made independently because nodes may hold
+different images. Nodes whose image list cannot be read are left untouched
+and reported as failures. If the archive's names cannot be compared safely
+(for example an OCI archive whose `org.opencontainers.image.ref.name`
+annotation holds only a tag with no repository), `kind` falls back to
+importing the whole archive on every node rather than risk skipping.
+
+Note that this is not a transaction: a malformed or truncated archive is
+rejected before any node is touched, but a runtime failure partway through
+can still leave earlier nodes updated. Each node's outcome is reported
+separately.
+
 This allows a workflow like:
 
 ```
